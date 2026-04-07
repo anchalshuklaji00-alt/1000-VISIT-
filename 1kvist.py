@@ -8,7 +8,7 @@ from flask import Flask, request, jsonify
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
 from google.protobuf import json_format
-from proto import FreeFire_pb2 # Tumhara apna proto
+import FreeFire_pb2 # Tumhara apna proto
 
 app = Flask(__name__)
 
