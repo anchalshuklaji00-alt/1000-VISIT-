@@ -23,6 +23,9 @@ USER_AGENT = "Dalvik/2.1.0 (Linux; U; Android 13; CPH2095 Build/RKQ1.211119.001)
 MAIN_KEY = base64.b64decode('WWcmdGMlREV1aDYlWmNeOA==')
 MAIN_IV = base64.b64decode('Nm95WkRyMjJFM3ljaGpNJQ==')
 
+# 🚨 NAYA: Vercel ke liye Global Cache
+CACHED_TOKENS = []
+
 # === HELPER FUNCTIONS ===
 def _pad(data: bytes) -> bytes:
     pad_len = AES.block_size - (len(data) % AES.block_size)
@@ -45,7 +48,7 @@ def Encrypt_ID(number):
         return bytes(encoded_bytes).hex()
     except: return ""
 
-# === TOKEN GENERATOR LOGIC (From Your Script) ===
+# === TOKEN GENERATOR LOGIC ===
 async def fetch_access_token(credential_str: str):
     url = "https://ffmconnect.live.gop.garenanow.com/oauth/guest/token/grant"
     payload = credential_str + "&response_type=token&client_type=2&client_secret=2ee44819e9b4598845141067b281621874d0d5d7af9d8f7e00c1e54715b7d1e3&client_id=100067"
@@ -77,23 +80,28 @@ async def fetch_jwt_for_account(acc):
     return msg.get("token", "")
 
 async def refresh_tokens_routine():
+    global CACHED_TOKENS
     try:
         with open("uidpass.json", "r") as f: accs = json.load(f)[:LIMIT]
     except: return []
     
     new_tokens = []
-    # Concurrency limit to prevent Vercel timeout crashes
     sem = asyncio.Semaphore(50) 
     async def process(acc):
         async with sem:
-            t = await fetch_jwt_for_account(acc)
-            if t: new_tokens.append({"token": t})
+            try:
+                # 🚨 NAYA: Try-Except taaki 1 kharab ID se poora code crash na ho
+                t = await fetch_jwt_for_account(acc)
+                if t: new_tokens.append({"token": t})
+            except: pass
             
     await asyncio.gather(*(process(acc) for acc in accs))
     
-    # Vercel mein data save karne ke liye /tmp folder zaroori hai
-    with open("/tmp/tokens.json", "w") as f: 
-        json.dump(new_tokens, f)
+    CACHED_TOKENS = new_tokens
+    try:
+        with open("/tmp/tokens.json", "w") as f: 
+            json.dump(new_tokens, f)
+    except: pass
     return new_tokens
 
 # === VISIT LOGIC ===
@@ -101,12 +109,17 @@ async def do_visit(client, token_dict, target_uid):
     url = f"https://client.ind.freefiremobile.com/GetPlayerPersonalShow"
     try:
         hex_payload = f"08{Encrypt_ID(target_uid)}1007"
-        # Isme AES CBC encryption lag raha hai hex bytes par
         payload = AES.new(MAIN_KEY, AES.MODE_CBC, MAIN_IV).encrypt(pad(bytes.fromhex(hex_payload), AES.block_size))
         headers = {"Host": "client.ind.freefiremobile.com", "User-Agent": USER_AGENT, "Accept-Encoding": "gzip", "Authorization": f"Bearer {token_dict['token']}", "X-GA": "v1 1", "ReleaseVersion": RELEASE_VERSION, "Content-Type": "application/x-www-form-urlencoded", "X-Unity-Version": "2018.4.11f1"}
         r = await client.post(url, headers=headers, content=payload, timeout=10)
         return r.status_code == 200
     except: return False
+
+async def run_all_visits(target_uid, tokens):
+    async with httpx.AsyncClient() as client:
+        tasks = [do_visit(client, t, target_uid) for t in tokens[:LIMIT]]
+        results = await asyncio.gather(*tasks)
+        return results
 
 # === FLASK ROUTES ===
 
@@ -114,30 +127,29 @@ async def do_visit(client, token_dict, target_uid):
 def home():
     return jsonify({"msg": f"Visit Bot is Running (Limit: {LIMIT})!"}), 200
 
-# 🔴 CRON-JOB WALA LINK: Ye har 6 ghante hit hona chahiye
 @app.route('/refresh')
-async def refresh_endpoint():
-    tokens = await refresh_tokens_routine()
+def refresh_endpoint():
+    # 🚨 FIX: async route ko Vercel pe chalane ke liye asyncio.run() zaruri hai
+    tokens = asyncio.run(refresh_tokens_routine())
     return jsonify({"msg": f"Tokens Refreshed: {len(tokens)}", "status": "success"})
 
-# 🟢 VISIT BADHANE WALA LINK
 @app.route('/visit')
-async def visit_endpoint():
+def visit_endpoint():
+    global CACHED_TOKENS
     target_uid = request.args.get('uid')
     if not target_uid: return jsonify({"error": "UID zaruri hai"}), 400
     
-    tokens = []
-    if os.path.exists("/tmp/tokens.json"):
-        with open("/tmp/tokens.json", "r") as f: tokens = json.load(f)
+    tokens = CACHED_TOKENS
+    if not tokens and os.path.exists("/tmp/tokens.json"):
+        try:
+            with open("/tmp/tokens.json", "r") as f: tokens = json.load(f)
+            CACHED_TOKENS = tokens
+        except: pass
     
-    # Agar tokens expire ho gaye ya file nahi mili, toh pehle naye banayega
     if not tokens:
-        tokens = await refresh_tokens_routine()
+        tokens = asyncio.run(refresh_tokens_routine())
 
-    async with httpx.AsyncClient() as client:
-        tasks = [do_visit(client, t, target_uid) for t in tokens[:LIMIT]]
-        results = await asyncio.gather(*tasks)
-
+    results = asyncio.run(run_all_visits(target_uid, tokens))
     return jsonify({"status": "success", "successful_visits": results.count(True)})
 
 if __name__ == '__main__':
